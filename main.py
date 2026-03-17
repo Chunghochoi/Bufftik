@@ -5,192 +5,236 @@ import telebot
 from telebot import types
 from flask import Flask
 import re
-import random
 import requests
-import zipfile
-
-import undetected_chromedriver as uc
+import random
+from datetime import datetime, timezone
+from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
 
 # --- CẤU HÌNH ---
 API_TOKEN = '8725772455:AAGVE5UM0qtlES1TWSygwz7flhaaLLbwqlI'
+# API Browserless của bạn
+BROWSERLESS_TOKEN = '2UADbr9XrUudNGMb8545fc3940547b391a950eefd007e04ad' 
+
 bot = telebot.TeleBot(API_TOKEN)
 app = Flask(__name__)
 
-PROXY_SCRAPE = [
-    "104.207.51.206:3129", "65.111.0.45:3129", "45.3.36.192:3129", "104.207.49.99:3129",
-    "216.26.246.0:3129", "104.207.53.210:3129", "216.26.236.43:3129", "151.123.178.209:3129"
-]
-
+# --- DANH SÁCH PROXY (Khôi phục từ bản trước) ---
 WEBSHARE = [
     "31.59.20.176:6754:jhxqqqco:39lpkdhlbvzn", "23.95.150.145:6114:jhxqqqco:39lpkdhlbvzn",
-    "198.23.239.134:6540:jhxqqqco:39lpkdhlbvzn", "45.38.107.97:6014:jhxqqqco:39lpkdhlbvzn",
-    "107.172.163.27:6543:jhxqqqco:39lpkdhlbvzn", "198.105.121.200:6462:jhxqqqco:39lpkdhlbvzn"
+    "198.23.239.134:6540:jhxqqqco:39lpkdhlbvzn", "45.38.107.97:6014:jhxqqqco:39lpkdhlbvzn"
 ]
 
 user_sessions = {}
 
-def get_public_ip():
-    try: return requests.get('https://api.ipify.org', timeout=5).text
-    except: return "Unknown"
+def get_current_time():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-def create_proxy_auth_extension(proxy_host, proxy_port, proxy_user, proxy_pass):
-    manifest_json = '{"version":"1.0.0","manifest_version":2,"name":"Chrome Proxy","permissions":["proxy","tabs","unlimitedStorage","storage","<all_urls>","webRequest","webRequestBlocking"],"background":{"scripts":["background.js"]},"minimum_chrome_version":"22.0.0"}'
-    background_js = 'var config={mode:"fixed_servers",rules:{singleProxy:{scheme:"http",host:"%s",port:parseInt(%s)},bypassList:["localhost"]}};chrome.proxy.settings.set({value:config,scope:"regular"},function(){});function callbackFn(details){return{authCredentials:{username:"%s",password:"%s"}}}chrome.webRequest.onAuthRequired.addListener(callbackFn,{urls:["<all_urls>"]},["blocking"]);' % (proxy_host, proxy_port, proxy_user, proxy_pass)
-    extension_path = 'proxy_auth_plugin.zip'
-    with zipfile.ZipFile(extension_path, 'w') as zp:
-        zp.writestr("manifest.json", manifest_json)
-        zp.writestr("background.js", background_js)
-    return os.path.abspath(extension_path)
-
-class ZefoyManager:
-    def __init__(self, chat_id, video_url, service_id, proxy_source):
+class ZefoyBotRemote:
+    def __init__(self, chat_id, video_url, service_id):
         self.chat_id = chat_id
         self.video_url = video_url
         self.service_id = service_id
-        self.proxy_source = proxy_source
-        self.services = {"2": "t-hearts-button", "3": "t-chearts-button", "4": "t-views-button", "5": "t-shares-button", "6": "t-favorites-button"}
+        self.success_count = 0
+        self.total_added = 0
         self.driver = None
+        
+        # Khôi phục danh sách dịch vụ từ bản gốc
+        self.services = {
+            "2": {"name": "Hearts", "button": "t-hearts-button", "increment": 30},
+            "3": {"name": "Comments Hearts", "button": "t-chearts-button", "increment": 10},
+            "4": {"name": "Views", "button": "t-views-button", "increment": 500},
+            "5": {"name": "Shares", "button": "t-shares-button", "increment": 150},
+            "6": {"name": "Favorites", "button": "t-favorites-button", "increment": 90}
+        }
 
     def create_driver(self):
-        # Đóng driver cũ nếu tồn tại để giải phóng RAM
-        if self.driver:
-            try: self.driver.quit()
-            except: pass
-
-        options = uc.ChromeOptions()
-        options.add_argument('--headless') # Dùng headless tiêu chuẩn để ổn định RAM
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage') # Chạy trên RAM thay vì /dev/shm
-        options.add_argument('--disable-gpu')
-        options.add_argument('--window-size=800,600') # Cửa sổ nhỏ nhất có thể
+        chrome_options = Options()
+        # Chạy Proxy qua Browserless nếu cần (Webshare)
+        proxy_str = random.choice(WEBSHARE)
+        ip, port, user, pwd = proxy_str.split(':')
         
-        # --- CẤU HÌNH SIÊU TIẾT KIỆM RAM ---
-        options.add_argument('--single-process') # Ép chạy 1 tiến trình (Tiết kiệm ~150MB RAM)
-        options.add_argument('--disable-application-cache')
-        options.add_argument('--disable-infobars')
-        options.add_argument('--no-first-run')
-        options.add_argument('--disable-setuid-sandbox')
+        # Cấu hình Remote WebDriver kết nối tới Browserless
+        remote_url = f"https://chrome.browserless.io/webdriver?token={BROWSERLESS_TOKEN}"
         
-        if self.proxy_source == "scrape":
-            p = random.choice(PROXY_SCRAPE)
-            options.add_argument(f'--proxy-server=http://{p}')
-        else:
-            p_str = random.choice(WEBSHARE)
-            ip, port, user, pwd = p_str.split(':')
-            auth_ext = create_proxy_auth_extension(ip, port, user, pwd)
-            options.add_argument(f'--load-extension={auth_ext}')
+        capabilities = {
+            "browserName": "chrome",
+            "goog:chromeOptions": {
+                "args": [
+                    "--no-sandbox", 
+                    "--disable-dev-shm-usage",
+                    "--disable-notifications",
+                    "--disable-popup-blocking"
+                ]
+            },
+            "browserless:options": {
+                "stealth": True,
+                "headless": True,
+                "proxy": f"http://{user}:{pwd}@{ip}:{port}" # Tích hợp thẳng proxy vào cloud
+            }
+        }
 
-        # Khởi tạo driver
-        self.driver = uc.Chrome(options=options, use_subprocess=True)
-        self.wait = WebDriverWait(self.driver, 35)
+        self.driver = webdriver.Remote(
+            command_executor=remote_url,
+            options=chrome_options
+        )
+        self.wait = WebDriverWait(self.driver, 40)
 
-    def start_process(self):
+    def send_tg(self, text):
+        bot.send_message(self.chat_id, text, parse_mode="Markdown")
+
+    def handle_alert(self):
+        try: self.driver.switch_to.alert.dismiss()
+        except: pass
+
+    def wait_for_ad(self):
+        self.send_tg("⏳ Đang lách quảng cáo Zefoy (30s)...")
+        time.sleep(30)
         try:
+            # Logic lách quảng cáo từ file gốc
+            ad_btn = self.driver.find_element(By.CLASS_NAME, "fc-rewarded-ad-button")
+            if ad_btn:
+                ad_btn.click()
+                time.sleep(10)
+                self.driver.refresh()
+                time.sleep(10)
+        except:
+            pass
+
+    def start(self):
+        try:
+            self.send_tg("🌐 Đang khởi tạo trình duyệt Cloud (RAM Usage: 0%)...")
             self.create_driver()
-            bot.send_message(self.chat_id, "🌐 Đang kết nối Zefoy (Low RAM Mode)...")
             self.driver.get("https://zefoy.com")
             
-            time.sleep(15)
-            try: self.driver.switch_to.alert.dismiss()
-            except: pass
+            self.wait_for_ad()
+            self.handle_alert()
 
-            captcha_img = self.wait.until(EC.presence_of_element_located((By.TAG_NAME, "img")))
+            # Chụp captcha gửi về Telegram
+            captcha_img = self.wait.until(EC.presence_of_element_located((By.XPATH, "//img")))
             captcha_img.screenshot("captcha.png")
+            
             with open("captcha.png", "rb") as photo:
-                bot.send_photo(self.chat_id, photo, caption="📸 Nhập Captcha:")
+                bot.send_photo(self.chat_id, photo, caption="🔑 **Nhập mã Captcha để bắt đầu:**")
             
             user_sessions[self.chat_id]['status'] = 'WAITING_CAPTCHA'
             user_sessions[self.chat_id]['manager'] = self
+            
         except Exception as e:
-            bot.send_message(self.chat_id, f"💥 RAM quá tải, bot tự khởi động lại. Vui lòng thử lại sau 1 phút.")
+            self.send_tg(f"❌ Lỗi khởi tạo: `{str(e)[:100]}`")
             if self.driver: self.driver.quit()
 
-    def submit_captcha(self, code):
+    def solve_and_run(self, captcha_text):
         try:
-            try: self.driver.switch_to.alert.dismiss()
-            except: pass
-            
-            self.driver.find_element(By.XPATH, "//input[@placeholder='Enter Word']").send_keys(code)
+            self.handle_alert()
+            # Điền captcha
+            self.driver.find_element(By.XPATH, "//input[@placeholder='Enter Word']").send_keys(captcha_text)
             self.driver.find_element(By.XPATH, "//button[contains(text(),'Submit')]").click()
-            time.sleep(7)
+            time.sleep(5)
             
-            btn = self.wait.until(EC.element_to_be_clickable((By.CLASS_NAME, self.services[self.service_id])))
-            btn.click()
-            bot.send_message(self.chat_id, "✅ Đã login thành công!")
-            self.loop_service()
+            # Chọn dịch vụ đã lưu
+            service = self.services[self.service_id]
+            self.wait.until(EC.element_to_be_clickable((By.CLASS_NAME, service["button"]))).click()
+            
+            self.send_tg(f"✅ Đăng nhập thành công! Bắt đầu buff **{service['name']}**...")
+            self.loop_process()
         except Exception as e:
-            bot.send_message(self.chat_id, "❌ Captcha sai hoặc lỗi RAM. Hãy /start lại.")
-            if self.driver: self.driver.quit()
+            self.send_tg(f"❌ Lỗi đăng nhập: Captcha sai hoặc Zefoy lag.")
+            self.driver.quit()
 
-    def loop_service(self):
+    def loop_process(self):
+        service = self.services[self.service_id]
         while True:
             try:
-                try: self.driver.switch_to.alert.dismiss()
-                except: pass
+                self.handle_alert()
+                # Gửi link
+                inp = self.wait.until(EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Enter Video URL']")))
+                inp.clear()
+                inp.send_keys(self.video_url)
                 
-                form = self.wait.until(EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Enter Video URL']")))
-                form.clear()
-                form.send_keys(self.video_url)
-                self.driver.find_element(By.XPATH, "//button[contains(@class, 'btn-search')] | //form//button").click()
+                self.driver.find_element(By.XPATH, "//button[contains(text(),'Search')]").click()
                 time.sleep(8)
                 
-                if "Please wait" in self.driver.page_source:
-                    bot.send_message(self.chat_id, "⏳ Đang cooldown...")
-                    time.sleep(80)
+                source = self.driver.page_source
+                if "Please wait" in source:
+                    wait_match = re.search(r"Please wait (\d+) minutes (\d+) seconds", source)
+                    msg = "⏳ Đang cooldown..."
+                    if wait_match: msg = f"⏳ Đợi: {wait_match.group(1)}p {wait_match.group(2)}s."
+                    self.send_tg(msg)
+                    time.sleep(75)
                     self.driver.refresh()
                     continue
-                
-                btn = self.driver.find_element(By.XPATH, "//button[contains(@class, 'btn-primary')] | //button[contains(@class, 'wbutton')]")
-                btn.click()
-                bot.send_message(self.chat_id, "🚀 Buff thành công!")
-                time.sleep(200) # Nghỉ lâu hơn để tránh spam
-                self.driver.refresh()
-            except:
-                time.sleep(20)
-                try: self.driver.refresh()
-                except: break
 
-@app.route('/')
-def home(): return f"IP: {get_public_ip()}"
+                # Nhấn nút buff cuối cùng
+                final_btns = self.driver.find_elements(By.XPATH, "//button[contains(@class, 'btn-primary')] | //button[contains(@class, 'wbutton')]")
+                for btn in final_btns:
+                    if btn.is_displayed():
+                        btn.click()
+                        self.success_count += 1
+                        self.total_added += service['increment']
+                        
+                        success_msg = f"✨ **THÀNH CÔNG** ✨\n"
+                        success_msg += f"🔥 Lượt buff: {self.success_count}\n"
+                        success_msg += f"📊 Tổng cộng: +{self.total_added} {service['name']}"
+                        self.send_tg(success_msg)
+                        break
+                
+                time.sleep(180) # Nghỉ 3 phút
+                self.driver.refresh()
+            except Exception:
+                time.sleep(20)
+                self.driver.refresh()
+
+# --- TELEGRAM INTERFACE ---
 
 @bot.message_handler(commands=['start'])
 def welcome(message):
-    bot.reply_to(message, f"🤖 **Zefoy Render-Ultra-Lite**\nIP: `{get_public_ip()}`\nGửi link TikTok.")
+    banner = f"🤖 **ZEFOY CLOUD BOT V3.0**\n"
+    banner += f"⏰ {get_current_time()}\n"
+    banner += f"🚀 Chế độ: **Remote Browser (Browserless)**\n"
+    banner += f"💎 RAM Render tiêu thụ: **~40MB**\n\n"
+    banner += "👉 Hãy gửi Link video TikTok của bạn."
+    bot.reply_to(message, banner, parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: 'tiktok.com' in m.text)
 def handle_link(message):
     user_sessions[message.chat.id] = {'url': message.text}
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("1️⃣ Scrape", callback_data="src_scrape"),
-               types.InlineKeyboardButton("2️⃣ Webshare", callback_data="src_webshare"))
-    bot.send_message(message.chat.id, "Chọn Proxy:", reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("src_"))
-def handle_src(call):
-    chat_id = call.message.chat.id
-    user_sessions[chat_id]['src'] = call.data.replace("src_", "")
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("👁 Views", callback_data="svc_4"), types.InlineKeyboardButton("❤️ Hearts", callback_data="svc_2"))
-    markup.add(types.InlineKeyboardButton("⭐ Favorites", callback_data="svc_6"))
-    bot.edit_message_text("Chọn dịch vụ:", chat_id, call.message.message_id, reply_markup=markup)
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("👁 Views", callback_data="svc_4"),
+        types.InlineKeyboardButton("❤️ Hearts", callback_data="svc_2"),
+        types.InlineKeyboardButton("💬 Comm. Hearts", callback_data="svc_3"),
+        types.InlineKeyboardButton("↪️ Shares", callback_data="svc_5"),
+        types.InlineKeyboardButton("⭐ Favorites", callback_data="svc_6")
+    )
+    bot.send_message(message.chat.id, "✨ Chọn dịch vụ bạn muốn buff:", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("svc_"))
-def handle_svc(call):
+def handle_service(call):
     chat_id = call.message.chat.id
-    data = user_sessions[chat_id]
-    manager = ZefoyManager(chat_id, data['url'], call.data.replace("svc_", ""), data['src'])
-    threading.Thread(target=manager.start_process).start()
+    service_id = call.data.replace("svc_", "")
+    url = user_sessions[chat_id]['url']
+    
+    manager = ZefoyBotRemote(chat_id, url, service_id)
+    threading.Thread(target=manager.start).start()
+    bot.answer_callback_query(call.id, "Đang kết nối tới trình duyệt Cloud...")
 
 @bot.message_handler(func=lambda m: user_sessions.get(m.chat.id, {}).get('status') == 'WAITING_CAPTCHA')
-def handle_captcha(message):
-    if message.chat.id in user_sessions and 'manager' in user_sessions[message.chat.id]:
-        manager = user_sessions[message.chat.id]['manager']
-        user_sessions[message.chat.id]['status'] = 'RUNNING'
-        threading.Thread(target=manager.submit_captcha, args=(message.text,)).start()
+def handle_captcha_input(message):
+    chat_id = message.chat.id
+    manager = user_sessions[chat_id]['manager']
+    user_sessions[chat_id]['status'] = 'RUNNING'
+    threading.Thread(target=manager.solve_and_run, args=(message.text,)).start()
+
+# --- WEB SERVER GIỮ CHỖ ---
+@app.route('/')
+def home():
+    return "Bot is running on Cloud Browserless!"
 
 if __name__ == '__main__':
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
+    print("Zefoy Bot is Online...")
     bot.infinity_polling()
