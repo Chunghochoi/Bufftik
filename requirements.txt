@@ -1,4 +1,5 @@
-aiogram>=3.5.0
-playwright>=1.42.0
-fastapi>=0.110.0
-uvicorn>=0.27.1
+python-telegram-bot
+selenium
+browserbase
+flask
+python-dotenv
