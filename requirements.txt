@@ -1,5 +1,4 @@
 flask
 pyTelegramBotAPI
 selenium==4.9.1
-undetected-chromedriver
 requests
