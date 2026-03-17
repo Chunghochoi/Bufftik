@@ -6,6 +6,7 @@ from telebot import types
 from flask import Flask
 import re
 import random
+import requests # Thêm thư viện để lấy IP
 
 # Thư viện Selenium và undetected_chromedriver
 from selenium.webdriver.common.by import By
@@ -19,7 +20,7 @@ API_TOKEN = '8725772455:AAGVE5UM0qtlES1TWSygwz7flhaaLLbwqlI'
 bot = telebot.TeleBot(API_TOKEN)
 app = Flask(__name__)
 
-# DANH SÁCH PROXY CỦA BẠN (Đã tích hợp)
+# DANH SÁCH PROXY CỦA BẠN
 PROXY_LIST = [
     "104.207.51.206:3129", "65.111.0.45:3129", "45.3.36.192:3129", "104.207.49.99:3129",
     "216.26.246.0:3129", "104.207.53.210:3129", "216.26.236.43:3129", "151.123.178.209:3129",
@@ -50,9 +51,18 @@ PROXY_LIST = [
 
 user_sessions = {}
 
+# --- HÀM LẤY IP CỦA RENDER ---
+def get_public_ip():
+    try:
+        # Sử dụng api ipify để lấy IP public của server Render
+        response = requests.get('https://api.ipify.org', timeout=10)
+        return response.text
+    except Exception as e:
+        return f"Lỗi: {str(e)}"
+
 @app.route('/')
 def home():
-    return "Bot Zefoy Proxy-Rotation is Running!"
+    return f"Bot is running. Server IP: {get_public_ip()}"
 
 def run_flask():
     app.run(host='0.0.0.0', port=10000)
@@ -66,20 +76,15 @@ class ZefoyManager:
         self.driver = None
 
     def create_driver(self):
-        # Chọn ngẫu nhiên 1 proxy từ danh sách
         proxy = random.choice(PROXY_LIST)
-        bot.send_message(self.chat_id, f"🛰️ Sử dụng Proxy: `{proxy}`")
+        bot.send_message(self.chat_id, f"🛰️ Đang dùng Proxy: `{proxy}`")
 
         options = uc.ChromeOptions()
         options.add_argument('--headless=new')
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
         options.add_argument('--disable-gpu')
-        
-        # --- CẤU HÌNH PROXY ---
         options.add_argument(f'--proxy-server=http://{proxy}')
-        
-        # --- STEALTH CONFIG ---
         options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36')
         options.add_argument('--disable-blink-features=AutomationControlled')
 
@@ -90,26 +95,21 @@ class ZefoyManager:
     def start_process(self):
         try:
             self.create_driver()
-            bot.send_message(self.chat_id, "🔗 Đang kết nối Zefoy qua Proxy...")
+            bot.send_message(self.chat_id, "🔗 Đang kết nối Zefoy...")
             self.driver.get("https://zefoy.com")
-            
             time.sleep(15) 
             
             try:
                 captcha_img = self.wait.until(EC.presence_of_element_located((By.XPATH, "//img[contains(@class, 'img-thumbnail')] | //img")))
                 captcha_img.screenshot("captcha.png")
-                
                 with open("captcha.png", "rb") as photo:
-                    bot.send_photo(self.chat_id, photo, caption="📸 Đã qua mặt Cloudflare!\nVui lòng nhập Captcha:")
-                
+                    bot.send_photo(self.chat_id, photo, caption="📸 Nhập Captcha:")
                 user_sessions[self.chat_id]['status'] = 'WAITING_CAPTCHA'
                 user_sessions[self.chat_id]['manager'] = self
-                
-            except Exception:
-                # Nếu không tìm thấy captcha, có thể do proxy này bị chậm hoặc Zefoy đã chặn IP proxy
-                bot.send_message(self.chat_id, "❌ Proxy này không load được Zefoy. Đang thử lại với Proxy khác...")
+            except:
+                bot.send_message(self.chat_id, "❌ Proxy lag hoặc bị chặn IP Render. Thử lại với Proxy khác...")
                 self.driver.quit()
-                self.start_process() # Thử lại tự động với proxy khác
+                self.start_process()
 
         except Exception as e:
             bot.send_message(self.chat_id, f"💥 Lỗi: {str(e)}")
@@ -121,15 +121,13 @@ class ZefoyManager:
             input_box.send_keys(code)
             self.driver.find_element(By.XPATH, "//button[contains(text(),'Submit')]").click()
             time.sleep(7)
-            
             service_btn_class = self.services.get(self.service_id)
             btn = self.wait.until(EC.element_to_be_clickable((By.CLASS_NAME, service_btn_class)))
             btn.click()
-            
-            bot.send_message(self.chat_id, "✅ Đăng nhập Proxy thành công! Bắt đầu buff...")
+            bot.send_message(self.chat_id, "✅ OK! Đang chạy...")
             self.loop_service()
-        except Exception:
-            bot.send_message(self.chat_id, "❌ Sai captcha hoặc Proxy bị lag. Vui lòng /start lại.")
+        except:
+            bot.send_message(self.chat_id, "❌ Lỗi captcha/login. Thử lại /start")
             self.driver.quit()
 
     def loop_service(self):
@@ -140,18 +138,15 @@ class ZefoyManager:
                 form.send_keys(self.video_url)
                 self.driver.find_element(By.XPATH, "//button[contains(@class, 'btn-search')] | //form//button").click()
                 time.sleep(6)
-                
                 if "Please wait" in self.driver.page_source:
-                    bot.send_message(self.chat_id, "⏳ Đang trong thời gian chờ (Cooldown)...")
                     time.sleep(70)
                     self.driver.refresh()
                     continue
-
                 buff_btns = self.driver.find_elements(By.XPATH, "//button[contains(@class, 'btn-primary')] | //button[contains(@class, 'wbutton')]")
                 for b in buff_btns:
                     if b.is_displayed():
                         b.click()
-                        bot.send_message(self.chat_id, "🚀 Buff thành công qua Proxy!")
+                        bot.send_message(self.chat_id, "🚀 Thành công!")
                         time.sleep(180)
                         self.driver.refresh()
                         break
@@ -162,7 +157,12 @@ class ZefoyManager:
 # --- TELEGRAM HANDLERS ---
 @bot.message_handler(commands=['start'])
 def welcome(message):
-    bot.reply_to(message, "🤖 **Zefoy Proxy Bot**\nGửi Link TikTok để bắt đầu.")
+    current_ip = get_public_ip()
+    msg = f"🤖 **Zefoy Bot Proxy**\n\n"
+    msg += f"📍 **IP Render hiện tại:** `{current_ip}`\n"
+    msg += f"⚠️ *Hãy add IP trên vào Whitelist của ProxyScrape nếu cần!*\n\n"
+    msg += f"Gửi Link TikTok để bắt đầu."
+    bot.reply_to(message, msg, parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: 'tiktok.com' in m.text)
 def handle_link(message):
