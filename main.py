@@ -48,7 +48,7 @@ class ZefoyBot:
         self.playwright = await async_playwright().start()
         
         # Endpoint WebSocket kết nối thẳng vào engine Playwright của Browserless
-        ws_endpoint = f"wss://chrome.browserless.io/playwright?token={self.browserless_token}&stealth=true&blockAds=true"
+        ws_endpoint = f"wss://chrome.browserless.io/?token={self.browserless_token}&stealth=true&blockAds=true"
         
         try:
             logger.info("Đang kết nối WebSocket tới Browserless...")
