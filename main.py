@@ -1,6 +1,6 @@
 """
-Telegram Bot Automation Architecture
-Python 3.11+ | Render Free Plan | Browserless.io
+Telegram Bot Automation Architecture - Production Ready
+Python 3.11+ | Render Free Plan | Browserless.io | Webshare Auth Proxy
 """
 import os
 import re
@@ -8,7 +8,7 @@ import time
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict
 from dataclasses import dataclass, field
 
 import requests
@@ -25,6 +25,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
     TimeoutException, NoSuchElementException, WebDriverException
 )
+from selenium.webdriver.common.proxy import Proxy, ProxyType
 
 # ==========================================
 # 1. CONFIG & LOGGING
@@ -42,15 +43,30 @@ class Config:
     BROWSERLESS_ENDPOINT = os.getenv("BROWSERLESS_ENDPOINT", "wss://chrome.browserless.io/")
     MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", 2)) # Render Free: keep it low (2-3)
     PORT = int(os.getenv("PORT", 10000))
-    # format: "ip:port:user:pass,ip:port:user:pass"
+    # format: "IP:PORT:USER:PASS,IP:PORT:USER:PASS"
     PROXY_LIST_RAW = os.getenv("PROXY_LIST", "")
 
 # ==========================================
-# 2. PROXY MANAGER
+# 2. PROXY MANAGER (Webshare Support)
 # ==========================================
 class ProxyManager:
     def __init__(self, raw_proxies: str):
-        self.proxies = [p.strip() for p in raw_proxies.split(",") if p.strip()]
+        self.proxies =[]
+        for p in raw_proxies.split(","):
+            p = p.strip()
+            if not p:
+                continue
+            
+            # Phân tích định dạng Webshare: IP:PORT:USER:PASS
+            parts = p.split(":")
+            if len(parts) == 4:
+                ip, port, user, pwd = parts
+                # Chuyển thành định dạng URL chuẩn cho Selenium/Browserless
+                proxy_url = f"http://{user}:{pwd}@{ip}:{port}"
+                self.proxies.append(proxy_url)
+            else:
+                self.proxies.append(p) # Fallback nếu là proxy không có pass
+                
         self._lock = threading.Lock()
         self._index = 0
 
@@ -95,7 +111,6 @@ class BrowserlessClient:
     def check_api_status() -> bool:
         """Kiểm tra quota và API endpoint của Browserless trước khi chạy"""
         try:
-            # Tuỳ thuộc vào endpoint của Browserless/nhà cung cấp
             api_url = Config.BROWSERLESS_ENDPOINT.replace("wss://", "https://").replace("ws://", "http://")
             url = f"{api_url}config?token={Config.BROWSERLESS_TOKEN}"
             resp = requests.get(url, timeout=10)
@@ -105,14 +120,14 @@ class BrowserlessClient:
             return False
 
     @staticmethod
-    def create_remote_driver(proxy: Optional[str] = None) -> WebDriver:
+    def create_remote_driver(proxy_url: Optional[str] = None) -> WebDriver:
         options = Options()
         options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--window-size=1280,720")
         
-        # Tối ưu RAM, chặn tải Media/Images/Fonts không cần thiết cho QA
+        # Tối ưu RAM, chặn tải Media/Images/Fonts không cần thiết
         prefs = {
             "profile.managed_default_content_settings.images": 2,
             "profile.managed_default_content_settings.stylesheet": 2,
@@ -120,12 +135,23 @@ class BrowserlessClient:
         }
         options.add_experimental_option("prefs", prefs)
 
-        if proxy:
-            options.add_argument(f"--proxy-server={proxy}")
+        # Xử lý Proxy có Auth cho Browserless
+        if proxy_url:
+            sel_proxy = Proxy()
+            sel_proxy.proxy_type = ProxyType.MANUAL
+            sel_proxy.http_proxy = proxy_url
+            sel_proxy.ssl_proxy = proxy_url
+            options.proxy = sel_proxy
+
+            # Khai báo theo chuẩn Browserless Capabilities
+            options.set_capability("browserless:options", {
+                "proxy": proxy_url
+            })
+            logger.info("Đã chèn Webshare Proxy vào Browserless session.")
 
         endpoint = f"{Config.BROWSERLESS_ENDPOINT}?token={Config.BROWSERLESS_TOKEN}"
         
-        # Retry mechanism for connecting to remote browser
+        # Cơ chế Retry khi kết nối
         for attempt in range(3):
             try:
                 driver = webdriver.Remote(
@@ -135,9 +161,10 @@ class BrowserlessClient:
                 driver.set_page_load_timeout(30)
                 return driver
             except Exception as e:
-                logger.warning(f"Failed to connect remote browser (Attempt {attempt+1}): {e}")
+                logger.warning(f"Lỗi kết nối remote browser (Lần {attempt+1}): {e}")
                 time.sleep(2)
-        raise WebDriverException("Could not connect to Browserless after 3 attempts")
+                
+        raise WebDriverException("Không thể kết nối đến Browserless sau 3 lần thử.")
 
 # ==========================================
 # 5. AUTOMATION MANAGER (CORE WORKFLOW)
@@ -157,7 +184,7 @@ class AutomationManager:
 
     @staticmethod
     def parse_wait_time(text: str) -> int:
-        """Trích xuất thời gian chờ (giây) từ văn bản, vd: 'wait 1 minute 30 seconds'"""
+        """Trích xuất thời gian chờ (giây) từ văn bản"""
         seconds = 0
         min_match = re.search(r'(\d+)\s*(min|minute|m)', text, re.IGNORECASE)
         sec_match = re.search(r'(\d+)\s*(sec|second|s)', text, re.IGNORECASE)
@@ -176,43 +203,43 @@ class AutomationManager:
             self.send_status(f"Đang truy cập: {self.url}")
             self.driver.get(self.url)
 
-            # VD: Kiểm tra trạng thái website (Title)
+            # Kiểm tra trạng thái website (Title)
             title = self.driver.title
             self.send_status(f"Đã tải trang thành công. Tiêu đề: {title}")
 
-            # VD: Giả lập kiểm tra Cooldown/Rate-Limit alert trên web
+            # Giả lập kiểm tra Cooldown/Rate-Limit alert trên web hợp lệ
             try:
                 alert_elem = WebDriverWait(self.driver, 5).until(
-                    EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'wait')]"))
+                    EC.presence_of_element_located((By.XPATH, "//*[contains(translate(text(), 'WAIT', 'wait'), 'wait')]"))
                 )
                 wait_text = alert_elem.text
                 wait_sec = self.parse_wait_time(wait_text)
-                self.send_status(f"Phát hiện Rate-Limit. Tạm dừng {wait_sec} giây...")
-                time.sleep(wait_sec) # Đây là lúc hợp lệ duy nhất để sleep (tôn trọng rate-limit)
+                self.send_status(f"Phát hiện Rate-Limit hoặc Cooldown. Tạm dừng {wait_sec} giây để tôn trọng server...")
+                time.sleep(wait_sec) 
                 
                 self.send_status("Đang tải lại trang...")
                 self.driver.refresh()
             except TimeoutException:
-                pass # Không có alert
+                pass # Không có cảnh báo chờ
 
             # Chụp ảnh màn hình làm bằng chứng QA
             self.send_status("Đang chụp ảnh màn hình xác thực...")
             screenshot = self.driver.get_screenshot_as_png()
-            self.bot.send_photo(self.chat_id, screenshot, caption="✅ Tác vụ hoàn tất.")
+            self.bot.send_photo(self.chat_id, screenshot, caption="✅ Tác vụ kiểm tra hoàn tất.")
 
         except TimeoutException as e:
             logger.error(f"Timeout at {self.url}: {e}")
             self.send_status("❌ Lỗi: Website tải quá chậm (Timeout).")
         except WebDriverException as e:
             logger.error(f"WebDriver Error for {self.chat_id}: {e}")
-            self.send_status("❌ Lỗi: Mất kết nối trình duyệt.")
+            self.send_status("❌ Lỗi: Mất kết nối trình duyệt từ xa.")
         except Exception as e:
             logger.exception("Unexpected automation error")
             self.send_status(f"❌ Lỗi hệ thống: {str(e)}")
         finally:
             if self.driver:
                 self.driver.quit()
-                logger.info(f"Driver closed for user {self.chat_id}")
+                logger.info(f"Driver closed for user {self.chat_id} cleanly.")
 
 # ==========================================
 # 6. TELEGRAM BOT APP
@@ -224,7 +251,7 @@ executor = ThreadPoolExecutor(max_workers=Config.MAX_CONCURRENT_JOBS)
 def handle_start(message):
     text = (
         "👋 Chào mừng đến với hệ thống QA & Monitor Bot.\n\n"
-        "Vui lòng gửi cho tôi một URL (bắt đầu bằng http) để bắt đầu kiểm tra trạng thái và chụp ảnh màn hình."
+        "Vui lòng gửi cho tôi một URL (bắt đầu bằng http/https) để bắt đầu kiểm tra trạng thái và chụp ảnh màn hình."
     )
     bot.send_message(message.chat.id, text)
 
@@ -279,7 +306,7 @@ def handle_qa_callback(call):
             session.lock.release()
             session.is_active = False
 
-    # Submit job vào ThreadPool thay vì chạy đồng bộ
+    # Submit job vào ThreadPool thay vì chạy đồng bộ để không block luồng Telegram
     executor.submit(background_job)
 
 # ==========================================
@@ -293,19 +320,20 @@ def health_check():
     return "Bot is alive and healthy!", 200
 
 def run_flask():
-    # Chạy trên port 10000 theo chuẩn Render
+    # Chạy trên port 10000 theo chuẩn Render (tránh báo lỗi Port In Use)
     app.run(host="0.0.0.0", port=Config.PORT)
 
 # ==========================================
 # 8. MAIN ENTRY POINT
 # ==========================================
 if __name__ == "__main__":
-    logger.info("Starting Flask Health Server...")
+    logger.info("Starting Flask Health Server on Thread...")
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
     logger.info("Starting Telegram Bot Polling...")
     try:
+        # skip_pending=True giúp bot không xử lý các tin nhắn cũ bị dồn ứ khi bot sập/khởi động lại
         bot.infinity_polling(skip_pending=True)
     except KeyboardInterrupt:
         logger.info("Graceful shutdown initiated...")
