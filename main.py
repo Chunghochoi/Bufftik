@@ -296,12 +296,13 @@ def handle_qa_callback(call):
 
     def background_job():
         try:
-            if not BrowserlessClient.check_api_status():
-                bot.send_message(user_id, "❌ Lỗi: Hệ thống Remote Browser đang bảo trì hoặc hết quota.")
-                return
-            
+            # Bỏ qua check HTTP, cho Selenium đâm thẳng vào Browserless
+            bot.send_message(user_id, "🔄 Đang kết nối tới máy chủ Browserless...")
             manager = AutomationManager(bot, user_id, url)
             manager.run_qa_workflow()
+        except Exception as e:
+            logger.error(f"Lỗi background job: {e}")
+            bot.send_message(user_id, "❌ Lỗi hệ thống khi khởi tạo trình duyệt từ xa.")
         finally:
             session.lock.release()
             session.is_active = False
