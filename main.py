@@ -13,13 +13,13 @@ from selenium.webdriver.support import expected_conditions as EC
 # --- CẤU HÌNH ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 BB_API_KEY = os.getenv("BROWSERBASE_API_KEY")
-BB_PROJECT_ID = os.getenv("BROWSERBASE_PROJECT_ID") # Có thể để trống nếu không có
+BB_PROJECT_ID = os.getenv("BROWSERBASE_PROJECT_ID")
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot Zefoy Cloud is live!"
+    return "Bot Zefoy Cloud V3 is running!"
 
 class ZefoyCloud:
     def __init__(self, chat_id, context, loop):
@@ -29,33 +29,35 @@ class ZefoyCloud:
         self.driver = None
 
     def send_telegram_msg(self, text):
+        """Gửi tin nhắn an toàn từ luồng Selenium về Telegram"""
         asyncio.run_coroutine_threadsafe(
             self.context.bot.send_message(chat_id=self.chat_id, text=f"🤖 {text}"),
             self.loop
         )
 
     def setup_driver(self):
-        """Kết nối Browserbase bằng cách truyền API Key vào Capabilities"""
-        self.send_telegram_msg("Đang khởi tạo trình duyệt Browserbase...")
-        
+        """Kết nối Browserbase theo chuẩn mới nhất của Selenium 4"""
         options = webdriver.ChromeOptions()
-        # Cách kết nối chuẩn của Browserbase cho Selenium
-        options.set_capability("browserbase:options", {
+        # Chèn API Key trực tiếp vào capability
+        bb_options = {
             "apiKey": BB_API_KEY,
-            "projectId": BB_PROJECT_ID if BB_PROJECT_ID else ""
-        })
+        }
+        if BB_PROJECT_ID:
+            bb_options["projectId"] = BB_PROJECT_ID
+            
+        options.set_capability("browserbase:options", bb_options)
 
         try:
-            # URL rút gọn, API Key đã nằm trong Capabilities
+            # URL chuẩn để tránh lỗi POST /webdriver
             self.driver = webdriver.Remote(
                 command_executor="https://connect.browserbase.com/webdriver",
                 options=options
             )
-            self.wait = WebDriverWait(self.driver, 30)
+            self.wait = WebDriverWait(self.driver, 45) # Tăng time chờ cho server Render
             return True
         except Exception as e:
-            self.send_telegram_msg(f"❌ Lỗi Driver: API Key không hợp lệ hoặc hết hạn.")
-            print(f"Driver Error: {str(e)}")
+            self.send_telegram_msg(f"❌ Lỗi Driver: Vui lòng kiểm tra Browserbase API Key.")
+            print(f"DEBUG Driver Error: {str(e)}")
             return False
 
     def solve_captcha_logic(self):
@@ -63,41 +65,30 @@ class ZefoyCloud:
 
         try:
             self.driver.get("https://zefoy.com")
-            time.sleep(8) # Tăng thời gian chờ trang load
+            time.sleep(10) # Chờ Zefoy load
             
-            # Kiểm tra xem có bị Cloudflare chặn không
-            if "Cloudflare" in self.driver.title:
-                self.send_telegram_msg("❌ Bị Cloudflare chặn. Đang thử lại...")
-                self.driver.quit()
-                return
-
-            # Tìm ảnh captcha bằng XPATH chính xác hơn
-            try:
-                img = self.wait.until(EC.presence_of_element_located((By.XPATH, "//img[contains(@src, 'captcha')]")))
-            except:
-                img = self.driver.find_element(By.TAG_NAME, "img") # Fallback
-
+            # Tìm ảnh captcha bằng XPATH linh hoạt
+            img = self.wait.until(EC.presence_of_element_located((By.XPATH, "//img[contains(@class, 'img-thumbnail')] | //img[contains(@src, 'captcha')]")))
+            
             path = f"captcha_{self.chat_id}.png"
             img.screenshot(path)
 
-            # Gửi ảnh về Telegram kèm hướng dẫn
             asyncio.run_coroutine_threadsafe(
                 self.context.bot.send_photo(
                     chat_id=self.chat_id, 
                     photo=open(path, 'rb'), 
-                    caption="🔑 Nhập mã Captcha để tiếp tục:"
+                    caption="🔑 Nhập mã Captcha (viết hoa/thường khớp ảnh):"
                 ),
                 self.loop
             )
         except Exception as e:
-            self.send_telegram_msg(f"❌ Lỗi Zefoy: Không tìm thấy Captcha. Có thể trang đang bảo trì.")
+            self.send_telegram_msg(f"❌ Lỗi: Không tải được Captcha. Hãy thử gửi lại link.")
             if self.driver: self.driver.quit()
 
-# Lưu trữ phiên
 active_sessions = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Bot Online! Hãy gửi link video TikTok.")
+    await update.message.reply_text("✅ Bot đã kết nối thành công! Gửi link TikTok để bắt đầu buff.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -105,7 +96,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_running_loop()
 
     if "tiktok.com" in text:
-        # Xóa session cũ nếu có để tránh Conflict Driver
+        await update.message.reply_text("⏳ Đang kết nối Browserbase... (mất khoảng 10-15s)")
+        
+        # Ngắt driver cũ nếu user gửi link mới
         if chat_id in active_sessions:
             try: active_sessions[chat_id]["instance"].driver.quit()
             except: pass
@@ -116,27 +109,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif chat_id in active_sessions and active_sessions[chat_id]["step"] == "WAIT_CAPTCHA":
         bot = active_sessions[chat_id]["instance"]
-        await update.message.reply_text("⌛ Đang xác thực mã...")
+        await update.message.reply_text("🔍 Đang xác thực mã captcha...")
         
         def input_captcha():
             try:
-                inp = bot.driver.find_element(By.XPATH, "//input[@placeholder='Enter Word']")
+                # Thử tìm ô nhập captcha
+                inp = bot.driver.find_element(By.TAG_NAME, "input")
+                inp.clear()
                 inp.send_keys(text)
-                inp.submit()
-                time.sleep(3)
-                bot.send_telegram_msg("✅ Đã nhập! Đang chuyển hướng...")
-                # Thêm logic chọn menu tại đây nếu cần
+                
+                # Tìm nút Submit
+                btn = bot.driver.find_element(By.TAG_NAME, "button")
+                btn.click()
+                
+                time.sleep(5)
+                bot.send_telegram_msg("✅ Đã gửi mã! Nếu bot không phản hồi thêm, có thể mã sai. Hãy thử gửi lại link TikTok.")
             except Exception as e:
-                bot.send_telegram_msg("❌ Lỗi: Không thể điền mã. Thử gửi lại link TikTok.")
+                bot.send_telegram_msg("❌ Lỗi: Trình duyệt đã đóng hoặc quá hạn. Hãy gửi lại link.")
         
         threading.Thread(target=input_captcha).start()
 
 def run_flask():
+    # Flask chạy cổng 8080 cho Render
     app.run(host='0.0.0.0', port=8080)
 
 if __name__ == '__main__':
+    # Chạy Web Server ngầm
     threading.Thread(target=run_flask, daemon=True).start()
-    app_tg = ApplicationBuilder().token(TOKEN).build()
-    app_tg.add_handler(CommandHandler('start', start))
-    app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    app_tg.run_polling()
+
+    # Khởi tạo Telegram Bot
+    application = ApplicationBuilder().token(TOKEN).build()
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    
+    # drop_pending_updates=True giúp xóa lệnh cũ, fix lỗi Conflict
+    print("Bot is starting...")
+    application.run_polling(drop_pending_updates=True)
