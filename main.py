@@ -1,341 +1,320 @@
-"""
-Telegram Bot Automation Architecture - Production Ready
-Python 3.11+ | Render Free Plan | Browserless.io | Webshare Auth Proxy
-"""
+import asyncio
 import os
 import re
 import time
+import random
 import logging
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Dict
-from dataclasses import dataclass, field
+from io import BytesIO
+from typing import Optional, Tuple
 
-import requests
-import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from flask import Flask
+from fastapi import FastAPI
+import uvicorn
+
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import Message, BufferedInputFile
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
 
 from selenium import webdriver
-from selenium.webdriver.remote.webdriver import WebDriver
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import (
-    TimeoutException, NoSuchElementException, WebDriverException
-)
-from selenium.webdriver.common.proxy import Proxy, ProxyType
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.chrome.options import Options
 
 # ==========================================
-# 1. CONFIG & LOGGING
+# CẤU HÌNH MÔI TRƯỜNG & LOGGING
 # ==========================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()]
-)
-logger = logging.getLogger("AutoBot")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-class Config:
-    TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_TOKEN")
-    BROWSERLESS_TOKEN = os.getenv("BROWSERLESS_TOKEN", "YOUR_BROWSERLESS_TOKEN")
-    BROWSERLESS_ENDPOINT = os.getenv("BROWSERLESS_ENDPOINT", "wss://chrome.browserless.io/")
-    MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", 2)) # Render Free: keep it low (2-3)
-    PORT = int(os.getenv("PORT", 10000))
-    # format: "IP:PORT:USER:PASS,IP:PORT:USER:PASS"
-    PROXY_LIST_RAW = os.getenv("PROXY_LIST", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_TOKEN")
+BROWSERLESS_TOKEN = os.getenv("BROWSERLESS_TOKEN", "YOUR_BROWSERLESS_TOKEN")
+PROXY_LIST = os.getenv("PROXY_LIST", "").split(",") # Dạng ip:port:user:pass
 
 # ==========================================
-# 2. PROXY MANAGER (Webshare Support)
+# CẤU TRÚC FSM (Finite State Machine)
 # ==========================================
-class ProxyManager:
-    def __init__(self, raw_proxies: str):
-        self.proxies =[]
-        for p in raw_proxies.split(","):
-            p = p.strip()
-            if not p:
-                continue
-            
-            # Phân tích định dạng Webshare: IP:PORT:USER:PASS
-            parts = p.split(":")
-            if len(parts) == 4:
-                ip, port, user, pwd = parts
-                # Chuyển thành định dạng URL chuẩn cho Selenium/Browserless
-                proxy_url = f"http://{user}:{pwd}@{ip}:{port}"
-                self.proxies.append(proxy_url)
-            else:
-                self.proxies.append(p) # Fallback nếu là proxy không có pass
-                
-        self._lock = threading.Lock()
-        self._index = 0
-
-    def get_proxy(self) -> Optional[str]:
-        with self._lock:
-            if not self.proxies:
-                return None
-            proxy = self.proxies[self._index]
-            self._index = (self._index + 1) % len(self.proxies)
-            return proxy
-
-proxy_manager = ProxyManager(Config.PROXY_LIST_RAW)
+class ZefoyFSM(StatesGroup):
+    waiting_for_url = State()
+    waiting_for_captcha = State()
+    processing = State()
 
 # ==========================================
-# 3. SESSION MANAGEMENT
+# MODULE 1: TỐI ƯU HÓA ZEFOY & BROWSERLESS
 # ==========================================
-@dataclass
-class BotSession:
-    user_id: int
-    is_active: bool = False
-    last_active: float = field(default_factory=time.time)
-    lock: threading.Lock = field(default_factory=threading.Lock)
+class ZefoyBot:
+    def __init__(self, browserless_token: str, proxy: Optional[str] = None):
+        self.browserless_token = browserless_token
+        self.proxy = proxy
+        self.driver = None
+        self.wait = None
 
-class SessionManager:
-    def __init__(self):
-        self.sessions: Dict[int, BotSession] = {}
-        self._lock = threading.Lock()
-
-    def get_session(self, user_id: int) -> BotSession:
-        with self._lock:
-            if user_id not in self.sessions:
-                self.sessions[user_id] = BotSession(user_id=user_id)
-            return self.sessions[user_id]
-
-session_manager = SessionManager()
-
-# ==========================================
-# 4. BROWSERLESS CLIENT
-# ==========================================
-class BrowserlessClient:
-    @staticmethod
-    def check_api_status() -> bool:
-        """Kiểm tra quota và API endpoint của Browserless trước khi chạy"""
-        try:
-            api_url = Config.BROWSERLESS_ENDPOINT.replace("wss://", "https://").replace("ws://", "http://")
-            url = f"{api_url}config?token={Config.BROWSERLESS_TOKEN}"
-            resp = requests.get(url, timeout=10)
-            return resp.status_code == 200
-        except requests.RequestException as e:
-            logger.error(f"Browserless API Check Failed: {e}")
-            return False
-
-    @staticmethod
-    def create_remote_driver(proxy_url: Optional[str] = None) -> WebDriver:
+    def init_driver(self):
+        """Khởi tạo Remote WebDriver kết nối với Browserless.io"""
         options = Options()
-        options.add_argument("--headless=new")
+        
+        # Tối ưu hóa cực độ cho RAM & Băng thông
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--window-size=1280,720")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-software-rasterizer")
         
-        # Tối ưu RAM, chặn tải Media/Images/Fonts không cần thiết
-        prefs = {
-            "profile.managed_default_content_settings.images": 2,
-            "profile.managed_default_content_settings.stylesheet": 2,
-            "profile.managed_default_content_settings.fonts": 2,
+        # Cấu hình đặc quyền của Browserless
+        browserless_options = {
+            "token": self.browserless_token,
+            "stealth": True, # Lách Cloudflare/Bot detection
+            "headless": True,
+            "blockAds": True, # Chặn toàn bộ Ads tiết kiệm băng thông
+            "ignoreDefaultArgs": ["--enable-automation"]
         }
-        options.add_experimental_option("prefs", prefs)
-
-        # Xử lý Proxy có Auth cho Browserless
-        if proxy_url:
-            sel_proxy = Proxy()
-            sel_proxy.proxy_type = ProxyType.MANUAL
-            sel_proxy.http_proxy = proxy_url
-            sel_proxy.ssl_proxy = proxy_url
-            options.proxy = sel_proxy
-
-            # Khai báo theo chuẩn Browserless Capabilities
-            options.set_capability("browserless:options", {
-                "proxy": proxy_url
-            })
-            logger.info("Đã chèn Webshare Proxy vào Browserless session.")
-
-        endpoint = f"{Config.BROWSERLESS_ENDPOINT}?token={Config.BROWSERLESS_TOKEN}"
         
-        # Cơ chế Retry khi kết nối
-        for attempt in range(3):
-            try:
-                driver = webdriver.Remote(
-                    command_executor=endpoint,
-                    options=options
-                )
-                driver.set_page_load_timeout(30)
-                return driver
-            except Exception as e:
-                logger.warning(f"Lỗi kết nối remote browser (Lần {attempt+1}): {e}")
-                time.sleep(2)
-                
-        raise WebDriverException("Không thể kết nối đến Browserless sau 3 lần thử.")
+        # Hỗ trợ Proxy Rotation nếu có
+        if self.proxy and len(self.proxy) > 5:
+            browserless_options["proxy"] = {"server": self.proxy}
 
-# ==========================================
-# 5. AUTOMATION MANAGER (CORE WORKFLOW)
-# ==========================================
-class AutomationManager:
-    def __init__(self, bot: telebot.TeleBot, chat_id: int, url: str):
-        self.bot = bot
-        self.chat_id = chat_id
-        self.url = url
-        self.driver: Optional[WebDriver] = None
+        options.set_capability("browserless:options", browserless_options)
 
-    def send_status(self, text: str):
         try:
-            self.bot.send_message(self.chat_id, f"🔄 {text}")
+            self.driver = webdriver.Remote(
+                command_executor="https://chrome.browserless.io/webdriver",
+                options=options
+            )
+            self.wait = WebDriverWait(self.driver, 15)
+            self.driver.set_window_size(1280, 720)
         except Exception as e:
-            logger.error(f"Failed to send status to {self.chat_id}: {e}")
+            logger.error(f"Lỗi khởi tạo driver: {e}")
+            raise
 
-    @staticmethod
-    def parse_wait_time(text: str) -> int:
-        """Trích xuất thời gian chờ (giây) từ văn bản"""
-        seconds = 0
-        min_match = re.search(r'(\d+)\s*(min|minute|m)', text, re.IGNORECASE)
-        sec_match = re.search(r'(\d+)\s*(sec|second|s)', text, re.IGNORECASE)
-        if min_match:
-            seconds += int(min_match.group(1)) * 60
-        if sec_match:
-            seconds += int(sec_match.group(1))
-        return seconds if seconds > 0 else 5 # default 5s retry
-
-    def run_qa_workflow(self):
-        proxy = proxy_manager.get_proxy()
+    def get_captcha(self) -> bytes:
+        """Truy cập Zefoy và lấy ảnh Captcha"""
+        self.driver.get("https://zefoy.com")
         try:
-            self.send_status("Đang khởi tạo Remote Browser...")
-            self.driver = BrowserlessClient.create_remote_driver(proxy)
+            # Smart Selector: Tìm ảnh captcha linh hoạt không dùng Xpath tuyệt đối
+            captcha_img = self.wait.until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "img.img-thumbnail, form img"))
+            )
+            # Chụp riêng vùng Captcha (Crop chính xác)
+            return captcha_img.screenshot_as_png
+        except TimeoutException:
+            raise Exception("Không tìm thấy Captcha hoặc trang load quá chậm.")
+
+    def submit_captcha(self, captcha_text: str) -> bool:
+        """Nhập captcha và kiểm tra xem có qua được không"""
+        try:
+            input_box = self.driver.find_element(By.CSS_SELECTOR, "input[placeholder*='captcha'], input[type='text']")
+            input_box.clear()
+            input_box.send_keys(captcha_text)
             
-            self.send_status(f"Đang truy cập: {self.url}")
-            self.driver.get(self.url)
-
-            # Kiểm tra trạng thái website (Title)
-            title = self.driver.title
-            self.send_status(f"Đã tải trang thành công. Tiêu đề: {title}")
-
-            # Giả lập kiểm tra Cooldown/Rate-Limit alert trên web hợp lệ
-            try:
-                alert_elem = WebDriverWait(self.driver, 5).until(
-                    EC.presence_of_element_located((By.XPATH, "//*[contains(translate(text(), 'WAIT', 'wait'), 'wait')]"))
-                )
-                wait_text = alert_elem.text
-                wait_sec = self.parse_wait_time(wait_text)
-                self.send_status(f"Phát hiện Rate-Limit hoặc Cooldown. Tạm dừng {wait_sec} giây để tôn trọng server...")
-                time.sleep(wait_sec) 
-                
-                self.send_status("Đang tải lại trang...")
-                self.driver.refresh()
-            except TimeoutException:
-                pass # Không có cảnh báo chờ
-
-            # Chụp ảnh màn hình làm bằng chứng QA
-            self.send_status("Đang chụp ảnh màn hình xác thực...")
-            screenshot = self.driver.get_screenshot_as_png()
-            self.bot.send_photo(self.chat_id, screenshot, caption="✅ Tác vụ kiểm tra hoàn tất.")
-
-        except TimeoutException as e:
-            logger.error(f"Timeout at {self.url}: {e}")
-            self.send_status("❌ Lỗi: Website tải quá chậm (Timeout).")
-        except WebDriverException as e:
-            logger.error(f"WebDriver Error for {self.chat_id}: {e}")
-            self.send_status("❌ Lỗi: Mất kết nối trình duyệt từ xa.")
+            submit_btn = self.driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
+            submit_btn.click()
+            time.sleep(2)
+            
+            # Nếu input box biến mất nghĩa là qua captcha
+            if len(self.driver.find_elements(By.CSS_SELECTOR, "input[placeholder*='captcha']")) == 0:
+                return True
+            return False
         except Exception as e:
-            logger.exception("Unexpected automation error")
-            self.send_status(f"❌ Lỗi hệ thống: {str(e)}")
-        finally:
-            if self.driver:
-                self.driver.quit()
-                logger.info(f"Driver closed for user {self.chat_id} cleanly.")
+            logger.error(f"Lỗi submit captcha: {e}")
+            return False
 
-# ==========================================
-# 6. TELEGRAM BOT APP
-# ==========================================
-bot = telebot.TeleBot(Config.TELEGRAM_TOKEN)
-executor = ThreadPoolExecutor(max_workers=Config.MAX_CONCURRENT_JOBS)
-
-@bot.message_handler(commands=['start', 'help'])
-def handle_start(message):
-    text = (
-        "👋 Chào mừng đến với hệ thống QA & Monitor Bot.\n\n"
-        "Vui lòng gửi cho tôi một URL (bắt đầu bằng http/https) để bắt đầu kiểm tra trạng thái và chụp ảnh màn hình."
-    )
-    bot.send_message(message.chat.id, text)
-
-@bot.message_handler(func=lambda msg: msg.text and msg.text.startswith("http"))
-def handle_url(message):
-    user_id = message.chat.id
-    session = session_manager.get_session(user_id)
-
-    # Sử dụng Lock để ngăn chặn 1 user spam nhiều job cùng lúc
-    if not session.lock.acquire(blocking=False):
-        bot.send_message(user_id, "⏳ Bạn đang có một tác vụ đang chạy. Vui lòng chờ hoàn tất!")
-        return
-
-    try:
-        session.is_active = True
-        session.last_active = time.time()
-        
-        markup = InlineKeyboardMarkup()
-        markup.add(
-            InlineKeyboardButton("Kiểm tra & Chụp ảnh", callback_data=f"qa|{message.text}")
-        )
-        bot.send_message(
-            user_id, 
-            f"Đã nhận URL: {message.text}\nBạn muốn thực hiện tác vụ nào?", 
-            reply_markup=markup
-        )
-    finally:
-        session.lock.release()
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("qa|"))
-def handle_qa_callback(call):
-    user_id = call.message.chat.id
-    url = call.data.split("|", 1)[1]
-    
-    bot.answer_callback_query(call.id, "Đưa tác vụ vào hàng đợi...")
-    bot.edit_message_reply_markup(user_id, call.message.message_id, reply_markup=None)
-    
-    session = session_manager.get_session(user_id)
-    if not session.lock.acquire(blocking=False):
-        bot.send_message(user_id, "⏳ Vui lòng chờ tác vụ trước đó hoàn tất.")
-        return
-
-    def background_job():
+    def check_cooldown(self) -> int:
+        """Regex Cooldown Detection: Trả về số giây cần chờ"""
         try:
-            # Bỏ qua check HTTP, cho Selenium đâm thẳng vào Browserless
-            bot.send_message(user_id, "🔄 Đang kết nối tới máy chủ Browserless...")
-            manager = AutomationManager(bot, user_id, url)
-            manager.run_qa_workflow()
+            # Tìm thẻ chứa thông báo "Please wait"
+            timer_element = self.driver.find_element(By.XPATH, "//*[contains(text(), 'Please wait')]")
+            text = timer_element.text.lower()
+            
+            # Regex trích xuất phút và giây linh hoạt
+            minutes = re.search(r'(\d+)\s*minute', text)
+            seconds = re.search(r'(\d+)\s*second', text)
+            
+            total_wait = 0
+            if minutes:
+                total_wait += int(minutes.group(1)) * 60
+            if seconds:
+                total_wait += int(seconds.group(1))
+                
+            return total_wait if total_wait > 0 else 30
+        except:
+            return 0 # Không có cooldown
+
+    def send_views(self, video_url: str) -> Tuple[bool, str, int]:
+        """Thực hiện buff view và trả về (Thành công?, Lời nhắn, Thời gian chờ)"""
+        try:
+            # Chọn dịch vụ Views (có thể thay đổi class nếu Zefoy update)
+            view_btn = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, ".t-views-button, button[data-target='#views']")))
+            view_btn.click()
+            time.sleep(1)
+
+            # Nhập link video
+            link_input = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[placeholder*='Enter Video']")))
+            link_input.clear()
+            link_input.send_keys(video_url)
+            
+            search_btn = self.driver.find_element(By.XPATH, "//button[contains(., 'Search')]")
+            search_btn.click()
+            time.sleep(3)
+
+            # Kiểm tra Cooldown
+            cooldown = self.check_cooldown()
+            if cooldown > 0:
+                return False, f"⏳ Bị giới hạn Cooldown. Vui lòng chờ {cooldown} giây.", cooldown
+
+            # Click nút buff (thường là nút hiển thị số view hiện tại)
+            submit_view = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn-dark, button[type='submit']")))
+            submit_view.click()
+            time.sleep(2)
+
+            return True, "✅ Buff View thành công! Đang chờ lượt tiếp theo...", 120 # Thường sau khi buff xong sẽ bị cooldown ~2p
+
         except Exception as e:
-            logger.error(f"Lỗi background job: {e}")
-            bot.send_message(user_id, "❌ Lỗi hệ thống khi khởi tạo trình duyệt từ xa.")
-        finally:
-            session.lock.release()
-            session.is_active = False
+            logger.error(f"Lỗi quá trình send view: {e}")
+            return False, "❌ Đã xảy ra lỗi khi buff. Thử lại sau.", 0
 
-    # Submit job vào ThreadPool thay vì chạy đồng bộ để không block luồng Telegram
-    executor.submit(background_job)
-
-# ==========================================
-# 7. HEALTH SERVER (FLASK)
-# ==========================================
-app = Flask(__name__)
-
-@app.route('/')
-@app.route('/healthz')
-def health_check():
-    return "Bot is alive and healthy!", 200
-
-def run_flask():
-    # Chạy trên port 10000 theo chuẩn Render (tránh báo lỗi Port In Use)
-    app.run(host="0.0.0.0", port=Config.PORT)
+    def close(self):
+        """QUAN TRỌNG: Giải phóng RAM và Session Browserless"""
+        if self.driver:
+            try:
+                self.driver.quit()
+            except:
+                pass
 
 # ==========================================
-# 8. MAIN ENTRY POINT
+# MODULE 2: TELEGRAM HANDLER (AIOGRAM 3.X)
 # ==========================================
-if __name__ == "__main__":
-    logger.info("Starting Flask Health Server on Thread...")
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+router = Router()
 
-    logger.info("Starting Telegram Bot Polling...")
+# Lưu trữ session Zefoy tạm thời cho từng user (Giữ trong RAM ít)
+user_sessions = {}
+
+def get_proxy():
+    """Health check proxy (Giả lập)"""
+    if not PROXY_LIST or PROXY_LIST[0] == "":
+        return None
+    return random.choice(PROXY_LIST)
+
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.answer("🚀 Chào mừng tới Zefoy Bot V5.0 (Ultra Lite).\n\n"
+                         "Sử dụng lệnh /zefoy để bắt đầu quá trình tăng tương tác TikTok.")
+
+@router.message(Command("zefoy"))
+async def cmd_zefoy(message: Message, state: FSMContext):
+    await message.answer("🔗 Vui lòng gửi Link video TikTok bạn muốn tăng View:")
+    await state.set_state(ZefoyFSM.waiting_for_url)
+
+@router.message(ZefoyFSM.waiting_for_url)
+async def process_url(message: Message, state: FSMContext):
+    video_url = message.text
+    if "tiktok.com" not in video_url:
+        await message.answer("❌ Link không hợp lệ. Vui lòng gửi lại link TikTok.")
+        return
+
+    await state.update_data(video_url=video_url)
+    msg = await message.answer("🔄 Đang khởi tạo trình duyệt và lấy Captcha. Vui lòng đợi...")
+    
+    user_id = message.from_user.id
+    proxy = get_proxy()
+    bot_instance = ZefoyBot(BROWSERLESS_TOKEN, proxy)
+    
     try:
-        # skip_pending=True giúp bot không xử lý các tin nhắn cũ bị dồn ứ khi bot sập/khởi động lại
-        bot.infinity_polling(skip_pending=True)
-    except KeyboardInterrupt:
-        logger.info("Graceful shutdown initiated...")
-        executor.shutdown(wait=False)
+        # Chạy Selenium trong ThreadPool để không block luồng asyncio
+        await asyncio.to_thread(bot_instance.init_driver)
+        captcha_bytes = await asyncio.to_thread(bot_instance.get_captcha)
+        
+        user_sessions[user_id] = bot_instance
+        
+        photo = BufferedInputFile(captcha_bytes, filename="captcha.png")
+        await message.answer_photo(photo, caption="📸 Vui lòng nhập mã Captcha trong ảnh trên:")
+        await state.set_state(ZefoyFSM.waiting_for_captcha)
+        await msg.delete()
+        
+    except Exception as e:
+        bot_instance.close()
+        await message.answer(f"❌ Lỗi khởi tạo: {str(e)}")
+        await state.clear()
+
+@router.message(ZefoyFSM.waiting_for_captcha)
+async def process_captcha(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    captcha_text = message.text
+    
+    if user_id not in user_sessions:
+        await message.answer("❌ Session đã hết hạn. Gõ /zefoy để làm lại.")
+        await state.clear()
+        return
+
+    bot_instance: ZefoyBot = user_sessions[user_id]
+    data = await state.get_data()
+    video_url = data['video_url']
+    
+    await message.answer("🔄 Đang xử lý yêu cầu...")
+    await state.set_state(ZefoyFSM.processing)
+
+    try:
+        # Submit Captcha
+        is_passed = await asyncio.to_thread(bot_instance.submit_captcha, captcha_text)
+        if not is_passed:
+            await message.answer("❌ Sai Captcha. Hãy gõ /zefoy để bắt đầu lại.")
+            return
+
+        # Vòng lặp Buff tự động với Async Sleep
+        while True:
+            success, msg_text, cooldown = await asyncio.to_thread(bot_instance.send_views, video_url)
+            
+            if success:
+                await message.answer(msg_text)
+                await message.answer(f"💤 Đang ngủ {cooldown}s để tránh ban...")
+                await asyncio.sleep(cooldown) # Sleep KHÔNG CHẶN (Non-blocking)
+            else:
+                if cooldown > 0:
+                    await message.answer(msg_text)
+                    await asyncio.sleep(cooldown + 5) # Chờ hết cooldown rồi tự động lặp lại
+                else:
+                    await message.answer(msg_text)
+                    break # Lỗi nặng, thoát vòng lặp
+
+    except Exception as e:
+        logger.error(f"Lỗi Runtime: {e}")
+        await message.answer("❌ Trình duyệt đã bị crash hoặc timeout.")
+    finally:
+        # Đảm bảo tài nguyên KHÔNG BAO GIỜ bị rò rỉ (Memory Leak)
+        await asyncio.to_thread(bot_instance.close)
+        if user_id in user_sessions:
+            del user_sessions[user_id]
+        await state.clear()
+
+# ==========================================
+# MODULE 3: FASTAPI (KEEP-ALIVE SERVER)
+# ==========================================
+app = FastAPI(title="Zefoy Bot V5.0 Server")
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "Zefoy Bot is running smoothly on Render."}
+
+# ==========================================
+# ĐIỂM KHỞI CHẠY (ENTRY POINT)
+# ==========================================
+async def start_bot():
+    bot = Bot(token=TELEGRAM_TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
+    
+    # Xóa webhook cũ nếu có để tránh xung đột
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Bot Telegram đã sẵn sàng nhận lệnh.")
+    await dp.start_polling(bot)
+
+@app.on_event("startup")
+async def on_startup():
+    # Khởi chạy Bot Telegram như một Background Task cùng lúc với FastAPI
+    asyncio.create_task(start_bot())
+
+if __name__ == "__main__":
+    # Render quy định cổng môi trường PORT, mặc định chạy 10000
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
