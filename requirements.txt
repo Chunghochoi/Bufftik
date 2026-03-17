@@ -2,3 +2,5 @@ flask
 pyTelegramBotAPI
 selenium
 undetected-chromedriver
+selenium-wire
+requests
