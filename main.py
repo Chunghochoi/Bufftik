@@ -8,19 +8,18 @@ import re
 import random
 import requests
 
-# Sử dụng selenium-wire để hỗ trợ Proxy có User:Pass
+# Sử dụng selenium-wire để hỗ trợ Proxy có Username:Password
 from seleniumwire import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import UnexpectedAlertPresentException
 
-# --- CẤU HÌNH ---
+# --- CẤU HÌNH TOKEN ---
 API_TOKEN = '8725772455:AAGVE5UM0qtlES1TWSygwz7flhaaLLbwqlI'
 bot = telebot.TeleBot(API_TOKEN)
 app = Flask(__name__)
 
-# DANH SÁCH PROXY
+# --- DANH SÁCH PROXY ---
 PROXY_SCRAPE = [
     "104.207.51.206:3129", "65.111.0.45:3129", "45.3.36.192:3129", "104.207.49.99:3129",
     "216.26.246.0:3129", "104.207.53.210:3129", "216.26.236.43:3129", "151.123.178.209:3129",
@@ -59,12 +58,14 @@ WEBSHARE = [
 
 user_sessions = {}
 
+# --- HÀM HỖ TRỢ ---
 def get_public_ip():
     try: return requests.get('https://api.ipify.org', timeout=5).text
     except: return "Không xác định"
 
 @app.route('/')
-def home(): return f"IP: {get_public_ip()}"
+def home():
+    return f"Zefoy Bot is Online. IP: {get_public_ip()}"
 
 class ZefoyManager:
     def __init__(self, chat_id, video_url, service_id, proxy_source):
@@ -72,7 +73,13 @@ class ZefoyManager:
         self.video_url = video_url
         self.service_id = service_id
         self.proxy_source = proxy_source
-        self.services = {"2": "t-hearts-button", "3": "t-chearts-button", "4": "t-views-button", "5": "t-shares-button", "6": "t-favorites-button"}
+        self.services = {
+            "2": "t-hearts-button", 
+            "3": "t-chearts-button", 
+            "4": "t-views-button", 
+            "5": "t-shares-button", 
+            "6": "t-favorites-button"
+        }
         self.driver = None
 
     def create_driver(self):
@@ -80,102 +87,126 @@ class ZefoyManager:
         options.add_argument('--headless=new')
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
-        # Sửa lỗi Alert: Tắt thông báo và popup
         options.add_argument('--disable-notifications')
         options.add_argument('--disable-popup-blocking')
+        options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36')
         
-        sw_options = {}
+        sw_options = {
+            'request_storage_base_dir': '/tmp', # Quan trọng để chạy trên Render
+            'proxy': {}
+        }
 
         if self.proxy_source == "scrape":
-            proxy = random.choice(PROXY_SCRAPE)
-            options.add_argument(f'--proxy-server=http://{proxy}')
-            bot.send_message(self.chat_id, f"🛰️ Nguồn: ProxyScrape\n📍 IP: `{proxy}`")
+            p = random.choice(PROXY_SCRAPE)
+            options.add_argument(f'--proxy-server=http://{p}')
+            bot.send_message(self.chat_id, f"🛰️ Nguồn: ProxyScrape\n📍 IP: `{p}`")
         else:
-            proxy_str = random.choice(WEBSHARE)
-            ip, port, user, pwd = proxy_str.split(':')
-            sw_options = {
-                'proxy': {
-                    'http': f'http://{user}:{pwd}@{ip}:{port}',
-                    'https': f'https://{user}:{pwd}@{ip}:{port}',
-                }
+            p_str = random.choice(WEBSHARE)
+            ip, port, user, pwd = p_str.split(':')
+            sw_options['proxy'] = {
+                'http': f'http://{user}:{pwd}@{ip}:{port}',
+                'https': f'https://{user}:{pwd}@{ip}:{port}',
             }
             bot.send_message(self.chat_id, f"🛰️ Nguồn: Webshare\n📍 IP: `{ip}:{port}`")
 
-        # Khởi tạo với selenium-wire
+        # Khởi tạo driver
         self.driver = uc.Chrome(options=options, seleniumwire_options=sw_options, use_subprocess=True)
-        self.wait = WebDriverWait(self.driver, 30)
+        self.wait = WebDriverWait(self.driver, 35)
+
+    def handle_unexpected_alert(self):
+        try:
+            alert = self.driver.switch_to.alert
+            alert.dismiss()
+        except:
+            pass
 
     def start_process(self):
         try:
             self.create_driver()
             self.driver.get("https://zefoy.com")
-            time.sleep(10)
+            time.sleep(12)
             
-            # Xử lý Alert nếu xuất hiện ngay khi vào trang
-            try: self.driver.switch_to.alert.dismiss()
-            except: pass
+            self.handle_unexpected_alert()
 
+            # Chụp captcha
             captcha_img = self.wait.until(EC.presence_of_element_located((By.TAG_NAME, "img")))
             captcha_img.screenshot("captcha.png")
+            
             with open("captcha.png", "rb") as photo:
-                bot.send_photo(self.chat_id, photo, caption="📸 Nhập Captcha:")
+                bot.send_photo(self.chat_id, photo, caption="📸 Hãy nhập mã Captcha từ ảnh trên:")
             
             user_sessions[self.chat_id]['status'] = 'WAITING_CAPTCHA'
             user_sessions[self.chat_id]['manager'] = self
+            
         except Exception as e:
             bot.send_message(self.chat_id, f"💥 Lỗi khởi tạo: {str(e)}")
             if self.driver: self.driver.quit()
 
     def submit_captcha(self, code):
         try:
-            # Xử lý Alert bất ngờ trước khi tương tác
-            try: self.driver.switch_to.alert.dismiss()
-            except: pass
-            
-            self.driver.find_element(By.XPATH, "//input[@placeholder='Enter Word']").send_keys(code)
+            self.handle_unexpected_alert()
+            inp = self.driver.find_element(By.XPATH, "//input[@placeholder='Enter Word']")
+            inp.send_keys(code)
             self.driver.find_element(By.XPATH, "//button[contains(text(),'Submit')]").click()
-            time.sleep(5)
+            time.sleep(6)
             
-            btn = self.wait.until(EC.element_to_be_clickable((By.CLASS_NAME, self.services[self.service_id])))
+            # Chọn service
+            btn_class = self.services.get(self.service_id)
+            btn = self.wait.until(EC.element_to_be_clickable((By.CLASS_NAME, btn_class)))
             btn.click()
-            bot.send_message(self.chat_id, "✅ OK! Đang chạy...")
+            
+            bot.send_message(self.chat_id, "✅ Đã vào thành công! Đang tiến hành buff...")
             self.loop_service()
         except Exception as e:
-            bot.send_message(self.chat_id, f"❌ Lỗi: {str(e)}")
+            bot.send_message(self.chat_id, f"❌ Lỗi captcha/login: {str(e)}")
             self.driver.quit()
 
     def loop_service(self):
         while True:
             try:
-                try: self.driver.switch_to.alert.dismiss()
-                except: pass
-                
+                self.handle_unexpected_alert()
+                # Nhập link
                 form = self.wait.until(EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Enter Video URL']")))
                 form.clear()
                 form.send_keys(self.video_url)
-                self.driver.find_element(By.XPATH, "//button[contains(@class, 'btn-search')] | //form//button").click()
-                time.sleep(6)
                 
+                search_btn = self.driver.find_element(By.XPATH, "//button[contains(@class, 'btn-search')] | //form//button")
+                search_btn.click()
+                time.sleep(8)
+                
+                # Check cooldown
                 if "Please wait" in self.driver.page_source:
-                    bot.send_message(self.chat_id, "⏳ Đang Cooldown...")
+                    wait_match = re.search(r"Please wait (\d+) minutes (\d+) seconds", self.driver.page_source)
+                    msg = "⏳ Hệ thống đang đợi cooldown..."
+                    if wait_match:
+                        msg = f"⏳ Cooldown: {wait_match.group(1)}p {wait_match.group(2)}s."
+                    bot.send_message(self.chat_id, msg)
                     time.sleep(70)
                     self.driver.refresh()
                     continue
-                
-                btn = self.driver.find_element(By.XPATH, "//button[contains(@class, 'btn-primary')] | //button[contains(@class, 'wbutton')]")
-                btn.click()
-                bot.send_message(self.chat_id, "🚀 Thành công!")
-                time.sleep(180)
-                self.driver.refresh()
-            except:
-                self.driver.refresh()
-                time.sleep(10)
 
-# --- TELEGRAM ---
+                # Nhấn nút buff
+                final_btns = self.driver.find_elements(By.XPATH, "//button[contains(@class, 'btn-primary')] | //button[contains(@class, 'wbutton')]")
+                for fb in final_btns:
+                    if fb.is_displayed():
+                        fb.click()
+                        bot.send_message(self.chat_id, "🚀 Buff thành công!")
+                        break
+                
+                time.sleep(180) # Nghỉ 3 phút
+                self.driver.refresh()
+                
+            except Exception:
+                time.sleep(10)
+                self.driver.refresh()
+
+# --- TELEGRAM HANDLERS ---
+
 @bot.message_handler(commands=['start'])
 def welcome(message):
     ip = get_public_ip()
-    bot.reply_to(message, f"🤖 **Zefoy Bot**\n📍 IP Render: `{ip}`\nGửi link TikTok để bắt đầu.")
+    msg = f"🤖 **Zefoy Bot v2**\n\n📍 IP Server: `{ip}`\n(Hãy whitelist IP này trong ProxyScrape)\n\nGửi link TikTok video để bắt đầu."
+    bot.reply_to(message, msg, parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: 'tiktok.com' in m.text)
 def handle_link(message):
@@ -183,31 +214,38 @@ def handle_link(message):
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("1️⃣ ProxyScrape (Whitelist)", callback_data="src_scrape"))
     markup.add(types.InlineKeyboardButton("2️⃣ Webshare (Auth)", callback_data="src_webshare"))
-    bot.send_message(message.chat.id, "Chọn nguồn Proxy muốn dùng:", reply_markup=markup)
+    bot.send_message(message.chat.id, "Vui lòng chọn nguồn Proxy:", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("src_"))
 def handle_src(call):
-    user_sessions[call.message.chat.id]['src'] = call.data.replace("src_", "")
+    chat_id = call.message.chat.id
+    user_sessions[chat_id]['src'] = call.data.replace("src_", "")
+    
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("👁️ Views", callback_data="svc_4"), types.InlineKeyboardButton("❤️ Hearts", callback_data="svc_2"))
     markup.add(types.InlineKeyboardButton("↪️ Shares", callback_data="svc_5"), types.InlineKeyboardButton("⭐ Favorites", callback_data="svc_6"))
-    bot.edit_message_text("Chọn dịch vụ:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+    bot.edit_message_text("Tiếp theo, hãy chọn dịch vụ:", chat_id, call.message.message_id, reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("svc_"))
 def handle_svc(call):
     chat_id = call.message.chat.id
     service_id = call.data.replace("svc_", "")
     data = user_sessions[chat_id]
+    
     manager = ZefoyManager(chat_id, data['url'], service_id, data['src'])
     threading.Thread(target=manager.start_process).start()
-    bot.answer_callback_query(call.id, "Đang khởi động...")
+    bot.answer_callback_query(call.id, "Đang khởi động tiến trình...")
 
 @bot.message_handler(func=lambda m: user_sessions.get(m.chat.id, {}).get('status') == 'WAITING_CAPTCHA')
 def handle_captcha(message):
     chat_id = message.chat.id
     user_sessions[chat_id]['status'] = 'RUNNING'
-    threading.Thread(target=user_sessions[chat_id]['manager'].submit_captcha, args=(message.text,)).start()
+    manager = user_sessions[chat_id]['manager']
+    threading.Thread(target=manager.submit_captcha, args=(message.text,)).start()
 
+# --- RUN ---
 if __name__ == '__main__':
+    # Chạy Web Server cho Render ở port 10000
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
+    print("Bot is starting...")
     bot.infinity_polling()
