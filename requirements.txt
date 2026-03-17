@@ -1,5 +1,2 @@
 python-telegram-bot
-selenium
-browserbase
-flask
 python-dotenv
