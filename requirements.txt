@@ -1,7 +1,5 @@
-blinker==1.7.0
 flask
 pyTelegramBotAPI
 selenium==4.9.1
 undetected-chromedriver
-selenium-wire
 requests
