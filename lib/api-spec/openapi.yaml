@@ -1,0 +1,178 @@
+openapi: 3.1.0
+info:
+  title: Api
+  version: 0.1.0
+  description: TikTok View Bot API
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: bot
+    description: TikTok View Bot operations
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+  /bot/start:
+    post:
+      operationId: startBot
+      tags: [bot]
+      summary: Start the view bot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartBotRequest"
+      responses:
+        "200":
+          description: Bot started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotActionResponse"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /bot/stop:
+    post:
+      operationId: stopBot
+      tags: [bot]
+      summary: Stop the view bot
+      responses:
+        "200":
+          description: Bot stopped
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotActionResponse"
+  /bot/stats:
+    get:
+      operationId: getBotStats
+      tags: [bot]
+      summary: Get current bot statistics
+      responses:
+        "200":
+          description: Bot statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotStats"
+  /bot/status:
+    get:
+      operationId: getBotStatus
+      tags: [bot]
+      summary: Get bot running status
+      responses:
+        "200":
+          description: Bot status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotStatus"
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+    StartBotRequest:
+      type: object
+      properties:
+        videoUrl:
+          type: string
+          description: TikTok video URL
+        workers:
+          type: number
+          description: Number of concurrent workers (optional, auto-detected if not set)
+      required:
+        - videoUrl
+    BotActionResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+      required:
+        - success
+        - message
+    BotStats:
+      type: object
+      properties:
+        isRunning:
+          type: boolean
+        videoUrl:
+          type: string
+        videoId:
+          type: string
+        totalViews:
+          type: number
+        elapsedTime:
+          type: number
+        viewsPerSecond:
+          type: number
+        viewsPerMinute:
+          type: number
+        viewsPerHour:
+          type: number
+        successRate:
+          type: number
+        successfulRequests:
+          type: number
+        failedRequests:
+          type: number
+        peakSpeed:
+          type: number
+        workers:
+          type: number
+      required:
+        - isRunning
+        - totalViews
+        - elapsedTime
+        - viewsPerSecond
+        - viewsPerMinute
+        - viewsPerHour
+        - successRate
+        - successfulRequests
+        - failedRequests
+        - peakSpeed
+        - workers
+    BotStatus:
+      type: object
+      properties:
+        isRunning:
+          type: boolean
+        videoUrl:
+          type: string
+        videoId:
+          type: string
+        startedAt:
+          type: number
+      required:
+        - isRunning
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
